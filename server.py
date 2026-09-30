@@ -51,7 +51,11 @@ def _error_payload(platform: str, exc: Exception) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None = None) -> str:
+async def get_unread_messages(
+    limit: int = 10,
+    platforms: list[Platform] | None = None,
+    scan_limit: int = 200,
+) -> str:
     """
     Aggregate unread direct messages from Telegram.
 
@@ -63,23 +67,31 @@ async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None 
         limit: Max messages to return (default 10).
         platforms: Subset of ["telegram"] to query. Defaults to all
                    when omitted.
+        scan_limit: How many dialogs to walk, newest first (default 200).
+            Telegram has no unread-only filter, so this is the bound that
+            keeps the call from timing out on accounts with many dialogs.
 
     Returns:
         JSON string: a list of message objects, each with
         message_id, platform, chat_id, sender_id, sender_name, timestamp,
-        text, has_media, chat_type, is_new; plus `last_check` and
-        `new_count`. Reading does not clear the unread flag in Telegram.
+        text, has_media, is_service, chat_type, is_new; plus `last_check`,
+        `new_count` and `dialogs_scanned`. Reading does not clear the unread
+        flag in Telegram.
     """
     targets: list[Platform] = [p for p in (platforms or ["telegram"]) if p == "telegram"]
     all_messages: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    scanned = 0
 
     last_check = _storage.get_kv("unread_last_check")
     cutoff = datetime.fromisoformat(last_check) if last_check else None
 
     if "telegram" in targets:
         try:
-            all_messages.extend(await _telegram.get_unread_messages(limit=limit))
+            fetched, scanned = await _telegram.get_unread_messages(
+                limit=limit, scan_limit=scan_limit
+            )
+            all_messages.extend(fetched)
         except TelegramNotAuthorizedError as exc:
             errors.append(_error_payload("telegram", exc))
         except Exception as exc:  # noqa: BLE001 - never crash the stdio pipe
@@ -108,6 +120,8 @@ async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None 
             "errors": errors,
             "last_check": last_check,
             "new_count": new_count,
+            "dialogs_scanned": scanned,
+            "truncated": scanned >= scan_limit,
             "note": "Reading here does not clear Telegram's unread flag; "
                     "call mark_as_read for that.",
         },

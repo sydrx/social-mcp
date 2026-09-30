@@ -17,6 +17,7 @@ Authentication note:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -64,21 +65,30 @@ class TelegramClientWrapper:
         self._cfg = cfg
         self._client = TelegramClient(cfg.session_path, cfg.api_id, cfg.api_hash)
         self._connected = False
+        # Tool calls run concurrently on one event loop, so several can reach
+        # connect() before _connected is set. Without this lock they all call
+        # TelegramClient.connect() concurrently and corrupt the sender state.
+        self._connect_lock = asyncio.Lock()
         self._created_chats: dict[int, Any] = {}  # cache created chat entities by id
         self._user_cache: dict[int, Any] = {}  # resolved users, survives dialog deletion
 
     async def connect(self) -> None:
         if self._connected:
             return
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            raise TelegramNotAuthorizedError(
-                "Telegram session is not authorized. Run 'python setup_auth.py "
-                "--telegram' first to complete the interactive login."
-            )
-        self._connected = True
-        await self._client.get_dialogs(limit=5)
-        logger.info("Telegram client connected, authorized, and cache warmed.")
+        async with self._connect_lock:
+            # Re-check inside the lock: a concurrent caller may have finished
+            # connecting while we were waiting for it.
+            if self._connected:
+                return
+            await self._client.connect()
+            if not await self._client.is_user_authorized():
+                raise TelegramNotAuthorizedError(
+                    "Telegram session is not authorized. Run 'python setup_auth.py "
+                    "--telegram' first to complete the interactive login."
+                )
+            self._connected = True
+            await self._client.get_dialogs(limit=5)
+            logger.info("Telegram client connected, authorized, and cache warmed.")
 
     async def disconnect(self) -> None:
         if self._connected:
@@ -127,14 +137,24 @@ class TelegramClientWrapper:
             logger.exception("Telegram mark_read failed")
             return {"success": False, "platform": "telegram", "error": str(exc)}
 
-    async def get_unread_messages(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Return up to `limit` most-recent unread messages across all dialogs."""
+    async def get_unread_messages(
+        self, limit: int = 10, scan_limit: int = 200
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return up to `limit` most-recent unread messages across dialogs.
+
+        Also returns how many dialogs were scanned. Telegram has no
+        "unread only" filter, so this walks dialogs newest-first and stops at
+        `scan_limit`; without a bound the very first call walked every dialog
+        in the account and timed out.
+        """
         await self.connect()
         results: list[dict[str, Any]] = []
+        scanned = 0
 
         try:
-            async for dialog in self._client.iter_dialogs():
+            async for dialog in self._client.iter_dialogs(limit=scan_limit):
                 dialog: Dialog
+                scanned += 1
                 if dialog.unread_count <= 0:
                     continue
 
@@ -167,12 +187,12 @@ class TelegramClientWrapper:
                     )
 
                     if len(results) >= limit:
-                        return results
+                        return results, scanned
         except RPCError as exc:
             logger.exception("Telegram RPC error while fetching unread messages")
             raise
 
-        return results
+        return results, scanned
 
     async def get_chat_history(
         self,
