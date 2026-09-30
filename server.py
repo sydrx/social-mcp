@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -54,6 +55,10 @@ async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None 
     """
     Aggregate unread direct messages from Telegram.
 
+    Reading does NOT mark anything as read in Telegram - use mark_as_read for
+    that. The `is_new` flag tells whether a message arrived since this tool
+    was last called, so "what's new since I last looked" has a real answer.
+
     Args:
         limit: Max messages to return (default 10).
         platforms: Subset of ["telegram"] to query. Defaults to all
@@ -61,12 +66,16 @@ async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None 
 
     Returns:
         JSON string: a list of message objects, each with
-        message_id, platform, sender_id, sender_name, timestamp,
-        text, chat_type.
+        message_id, platform, chat_id, sender_id, sender_name, timestamp,
+        text, has_media, chat_type, is_new; plus `last_check` and
+        `new_count`. Reading does not clear the unread flag in Telegram.
     """
     targets: list[Platform] = [p for p in (platforms or ["telegram"]) if p == "telegram"]
     all_messages: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+
+    last_check = _storage.get_kv("unread_last_check")
+    cutoff = datetime.fromisoformat(last_check) if last_check else None
 
     if "telegram" in targets:
         try:
@@ -77,16 +86,169 @@ async def get_unread_messages(limit: int = 10, platforms: list[Platform] | None 
             logger.exception("Unexpected error fetching Telegram unread messages")
             errors.append(_error_payload("telegram", exc))
 
+    new_count = 0
     for msg in all_messages:
+        # is_seen must be read BEFORE mark_seen, otherwise the row was just
+        # inserted and every message would look already-known.
+        seen_before = _storage.is_seen(msg["platform"], msg["message_id"])
+        if cutoff is not None:
+            arrived = datetime.fromisoformat(msg["timestamp"]) > cutoff
+        else:
+            arrived = not seen_before
+        msg["is_new"] = arrived
+        new_count += int(arrived)
         _storage.mark_seen(msg["platform"], msg["message_id"], msg.get("sender_id"))
 
     all_messages.sort(key=lambda m: m["timestamp"], reverse=True)
+    _storage.set_kv("unread_last_check", datetime.now(timezone.utc).isoformat())
 
-    return json.dumps({"messages": all_messages, "errors": errors}, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "messages": all_messages,
+            "errors": errors,
+            "last_check": last_check,
+            "new_count": new_count,
+            "note": "Reading here does not clear Telegram's unread flag; "
+                    "call mark_as_read for that.",
+        },
+        ensure_ascii=False, indent=2,
+    )
 
 
 @mcp.tool()
-async def send_reply(platform: Platform, target_id: str, text: str) -> str:
+async def mark_as_read(platform: Platform, chat_id: str | None = None) -> str:
+    """
+    Mark messages as read in Telegram, clearing the unread flag.
+
+    Opt-in: get_unread_messages never changes read state on its own. Use this
+    only when the boss asks, otherwise the Telegram badge will keep growing
+    forever.
+
+    Args:
+        platform: "telegram".
+        chat_id: Which dialog to clear. Omit to clear every dialog that
+                 currently has unread messages.
+
+    Returns:
+        JSON string with the chats that were cleared.
+    """
+    try:
+        if platform == "telegram":
+            result = await _telegram.mark_read(chat_id)
+        else:
+            result = {"success": False, "platform": platform, "error": f"Unknown platform '{platform}'."}
+    except TelegramNotAuthorizedError as exc:
+        result = _error_payload(platform, exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error marking messages as read on %s", platform)
+        result = _error_payload(platform, exc)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def list_dialogs(
+    limit: int = 50,
+    only_groups: bool = False,
+    only_unread: bool = False,
+) -> str:
+    """
+    List conversations so their ids can be used as targets for other tools.
+
+    Use this first when you do not know the chat id of a conversation.
+
+    Args:
+        limit: Max dialogs to return (default 50).
+        only_groups: Only groups, supergroups and channels.
+        only_unread: Only dialogs with unread messages.
+
+    Returns:
+        JSON string with a list of {chat_id, title, chat_type, unread_count,
+        participants_count, last_message_id, last_message_at,
+        last_message_preview}.
+    """
+    try:
+        dialogs = await _telegram.list_dialogs(
+            limit=limit, only_groups=only_groups, only_unread=only_unread
+        )
+        return json.dumps(
+            {"success": True, "platform": "telegram", "dialogs": dialogs},
+            ensure_ascii=False, indent=2,
+        )
+    except TelegramNotAuthorizedError as exc:
+        return json.dumps(_error_payload("telegram", exc), ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error listing dialogs")
+        return json.dumps(_error_payload("telegram", exc), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_chat_info(platform: Platform, target_id: str) -> str:
+    """
+    Describe a chat and list its members with roles, where permitted.
+
+    Args:
+        platform: "telegram".
+        target_id: Chat ID, user ID, or username.
+
+    Returns:
+        JSON string with chat metadata and, for groups, a `members` list.
+        Listing members of a supergroup requires admin rights; without them
+        the response carries `members_error` instead of the list.
+    """
+    try:
+        if platform == "telegram":
+            info = await _telegram.get_chat_info(target_id)
+        else:
+            return json.dumps(
+                {"success": False, "platform": platform, "error": f"Unknown platform '{platform}'."}
+            )
+        info["success"] = True
+        return json.dumps(info, ensure_ascii=False, indent=2)
+    except TelegramNotAuthorizedError as exc:
+        return json.dumps(_error_payload("telegram", exc), ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error reading chat info")
+        return json.dumps(_error_payload("telegram", exc), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def unban_user_from_group(platform: Platform, group_id: str, user_id: str) -> str:
+    """
+    Lift a ban in a supergroup.
+
+    The counterpart of remove_user_from_group, which bans in supergroups.
+    Basic groups have no ban list, so this reports `not_applicable` there.
+
+    Args:
+        platform: "telegram".
+        group_id: Supergroup/channel ID.
+        user_id: Banned user ID or @username.
+
+    Returns:
+        JSON string with success status. Note that after a ban is lifted the
+        user still has to rejoin by themselves.
+    """
+    try:
+        if platform == "telegram":
+            result = await _telegram.unban_user_from_group(group_id, user_id)
+        else:
+            result = {"success": False, "platform": platform, "error": f"Unknown platform '{platform}'."}
+    except TelegramNotAuthorizedError as exc:
+        result = _error_payload(platform, exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error unbanning user on %s", platform)
+        result = _error_payload(platform, exc)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def send_reply(
+    platform: Platform,
+    target_id: str,
+    text: str,
+    reply_to_message_id: str | None = None,
+    silent: bool = False,
+) -> str:
     """
     Send a direct message/reply to a specific recipient on Telegram.
 
@@ -98,6 +260,9 @@ async def send_reply(platform: Platform, target_id: str, text: str) -> str:
         platform: "telegram".
         target_id: Chat ID, user ID, or username to send to.
         text: The message text to send.
+        reply_to_message_id: Optional message ID to reply to, making it a
+            threaded reply. Use the `message_id` from get_chat_history.
+        silent: Send without a notification sound.
 
     Returns:
         JSON string with success status and delivery metadata, or a
@@ -110,7 +275,11 @@ async def send_reply(platform: Platform, target_id: str, text: str) -> str:
 
     try:
         if platform == "telegram":
-            result = await _telegram.send_message(target_id, text)
+            result = await _telegram.send_message(
+                target_id, text,
+                reply_to_message_id=reply_to_message_id,
+                silent=silent,
+            )
         else:
             result = {"success": False, "platform": platform, "error": f"Unknown platform '{platform}'."}
     except TelegramNotAuthorizedError as exc:
@@ -150,7 +319,12 @@ async def edit_message(platform: Platform, chat_id: str, message_id: str, text: 
 
 
 @mcp.tool()
-async def get_chat_history(platform: Platform, target_id: str, limit: int = 10) -> str:
+async def get_chat_history(
+    platform: Platform,
+    target_id: str,
+    limit: int = 10,
+    offset_id: str | None = None,
+) -> str:
     """
     Fetch the last N messages from a specific conversation, for context
     before drafting a reply.
@@ -159,6 +333,8 @@ async def get_chat_history(platform: Platform, target_id: str, limit: int = 10) 
         platform: "telegram".
         target_id: Chat ID, user ID, or username of the conversation.
         limit: Number of recent messages to retrieve (default 10).
+        offset_id: Page backwards. Pass the OLDEST message_id from the
+            previous page to continue into older history.
 
     Returns:
         JSON string: a list of message objects (oldest to newest is not
@@ -166,7 +342,9 @@ async def get_chat_history(platform: Platform, target_id: str, limit: int = 10) 
     """
     try:
         if platform == "telegram":
-            history = await _telegram.get_chat_history(target_id, limit=limit)
+            history = await _telegram.get_chat_history(
+                target_id, limit=limit, offset_id=offset_id
+            )
         else:
             return json.dumps(
                 {"success": False, "platform": platform, "error": f"Unknown platform '{platform}'."}
@@ -219,6 +397,9 @@ async def delete_chat(platform: Platform, chat_id: str) -> str:
         - Basic group: dissolution ritual — kicks EVERY member, then
           leaves, then revoke-purges the leftover dialog.
         - Owned channel/supergroup: hard deletion (works even after leaving).
+        - Foreign supergroup: bans EVERY member, then leaves, then purges our
+          copy. The group survives for its owner (Telegram allows only the
+          owner to destroy it), but is left empty of the people we brought in.
         - Private dialog: revoke-deletes the conversation.
 
     To exit a group WITHOUT touching its members, use leave_chat.

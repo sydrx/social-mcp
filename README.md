@@ -39,6 +39,7 @@ social-mcp/
 ├── storage.py
 ├── server.py
 ├── setup_auth.py
+├── .env.example
 ├── requirements.txt
 └── README.md
 ```
@@ -110,14 +111,35 @@ Add this to `~/.config/opencode/opencode.json` (adjust paths to your machine):
 
 Restart OpenCode. It should discover these tools:
 
-- `get_unread_messages(limit?, platforms?)`
-- `send_reply(platform, target_id, text)`
-- `get_chat_history(platform, target_id, limit?)`
+- `list_dialogs(limit?, only_groups?, only_unread?)` — **start here** when the chat id is unknown
+- `get_chat_info(platform, target_id)` — chat metadata plus members and roles
+- `get_unread_messages(limit?, platforms?)` — adds `is_new` and `new_count`; never changes read state
+- `mark_as_read(platform, chat_id?)` — **opt-in** clears Telegram's unread flag; omit `chat_id` to clear every dialog with unread messages
+- `send_reply(platform, target_id, text, reply_to_message_id?, silent?)`
+- `get_chat_history(platform, target_id, limit?, offset_id?)` — `offset_id` pages backwards
 - `edit_message` / `delete_message`
-- `delete_chat` — full dissolution: kicks all members, leaves, purges (groups); hard-deletes owned channels; revoke-deletes private dialogs
+- `delete_chat` — full dissolution: kicks all members, leaves, purges (groups); hard-deletes owned channels; revokes and purges private dialogs
 - `leave_chat` — exit a group/channel without touching its members
 - `block_user` / `unblock_user` / `get_blocked_users`
-- `create_group` / `create_supergroup` / `add_user_to_group` / `remove_user_from_group` / `invite_to_channel`
+- `create_group` / `create_supergroup` / `add_user_to_group` / `remove_user_from_group` / `unban_user_from_group` / `invite_to_channel`
+
+### Notes on Telegram limits
+
+- **Only the owner can destroy a group.** In a supergroup you do not own,
+  `delete_chat` bans every member, leaves and purges your own copy, but the
+  group itself survives. `remove_user_from_group` bans in supergroups; undo it
+  with `unban_user_from_group` (a banned user has to rejoin on their own).
+- **A bare user id needs its access_hash.** Once a dialog is deleted the entity
+  leaves the session cache and the id stops resolving — pass an `@username`
+  instead, which Telegram resolves network-side.
+- **Media is not dropped.** Messages carrying only a photo, voice note, file or
+  sticker are reported with a `[photo]`-style placeholder and `has_media: true`.
+- **Reading never marks as read.** `get_unread_messages` is side-effect free on
+  Telegram, so the unread badge never drops on its own. Call `mark_as_read`
+  when you actually want it cleared, or the counter grows forever.
+- **`new_count` needs two calls to be useful.** The first call has no cutoff
+  and counts everything unseen; afterwards it reports what arrived since the
+  previous call.
 
 ## Example agent workflow
 
